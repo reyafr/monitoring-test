@@ -63,3 +63,5 @@ src/
 └── services/
     └── googleSheets.js      # Pengambilan dan normalisasi data Google Sheets
 ```
+
+Panduan lengkap deployment tersedia di [DEPLOY.md](./DEPLOY.md).
