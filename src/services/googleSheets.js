@@ -1,12 +1,20 @@
 const API_BASE = 'https://sheets.googleapis.com/v4/spreadsheets'
-const DEFAULT_GID = 1883378372
 
-const normalizeKey = (value = '') =>
-  value.toLowerCase().replace(/[^a-z0-9]/g, '')
+const normalizeKey = (value = '') => value.toLowerCase().replace(/[^a-z0-9]/g, '')
+
+const EMPTY_VALUES = new Set(['', '-', '--', '–', '—', 'n/a', 'na', 'null', 'undefined', 'tbd'])
+
+const normalizeCell = (value) => {
+  const trimmed = value?.trim() ?? ''
+  return EMPTY_VALUES.has(trimmed.toLowerCase()) ? '' : trimmed
+}
 
 const getValue = (record, aliases) => {
-  const key = aliases.find((alias) => record[normalizeKey(alias)] !== undefined)
-  return key ? record[normalizeKey(key)] : ''
+  for (const alias of aliases) {
+    const key = normalizeKey(alias)
+    if (record[key] !== undefined && record[key] !== '') return normalizeCell(record[key])
+  }
+  return ''
 }
 
 const parseDate = (value) => {
@@ -19,27 +27,32 @@ const parseDate = (value) => {
   return isValid ? date : null
 }
 
-const normalizeRows = (values) => {
+const hasTestCaseHeader = (headers) => headers.includes('testcaseid')
+
+const normalizeRows = (values, sheetName) => {
   if (!values?.length) return []
   const headers = values[0].map(normalizeKey)
+  if (!hasTestCaseHeader(headers)) return []
 
   return values.slice(1).map((row, index) => {
     const record = Object.fromEntries(headers.map((header, column) => [header, row[column] ?? '']))
-    const testCaseId = getValue(record, ['Test Case ID', 'TestCaseID'])
+    const testCaseId = getValue(record, ['Test Case ID'])
     const testingCase = getValue(record, ['Testing Case', 'Test Case'])
     const issue = getValue(record, ['Issue', 'QA Issue'])
-    const qaStatus = getValue(record, ['QA Status', 'Status QA'])
+    const qaStatus = getValue(record, ['Status QA', 'QA Status', 'Status'])
     const devStatus = getValue(record, ['Dev Status', 'Status Dev'])
     const retestStatus = getValue(record, ['Retest Status', 'Status Retest'])
-    const testDate = getValue(record, ['Test Date', 'Latest'])
+    const testDate = getValue(record, ['Test Date', 'Test Date Latest'])
 
     return {
-      id: `${testCaseId || 'row'}-${index + 2}`,
+      id: `${sheetName}-${testCaseId || 'row'}-${index + 2}`,
       rowNumber: index + 2,
-      scenarioId: getValue(record, ['Test Skenario', 'Test Scenario', 'Column 1']),
+      sheetName,
+      scenarioId: getValue(record, ['Scenario ID', 'Column 1']),
+      brdReference: getValue(record, ['BRD Reference']),
       testCaseId,
       testingCase,
-      testType: getValue(record, ['Testing Case Type', 'Case', 'Type']),
+      testType: getValue(record, ['Testing Case']),
       testStep: getValue(record, ['Test Step']),
       testData: getValue(record, ['Test Data']),
       expectedResult: getValue(record, ['Expected Result']),
@@ -47,13 +60,13 @@ const normalizeRows = (values) => {
       picQa: getValue(record, ['PIC QA', 'QA PIC']),
       qaStatus,
       issue,
-      picDev: getValue(record, ['PIC DEV', 'DEV PIC']),
+      picDev: getValue(record, ['PIC DEV', 'PIC Dev', 'DEV PIC']),
       devStatus,
       retestStatus,
       evidence: getValue(record, ['Evidence']),
       testDate,
       parsedDate: parseDate(testDate),
-      hasIssue: Boolean(issue.trim()),
+      hasIssue: Boolean(issue),
     }
   }).filter((row) => row.testCaseId || row.testingCase || row.issue)
 }
@@ -61,7 +74,7 @@ const normalizeRows = (values) => {
 export async function fetchIssueData() {
   const apiKey = import.meta.env.VITE_GOOGLE_SHEETS_API_KEY
   const spreadsheetId = import.meta.env.VITE_GOOGLE_SHEET_ID
-  const targetGid = Number(import.meta.env.VITE_GOOGLE_SHEET_GID || DEFAULT_GID)
+  const onlyGid = import.meta.env.VITE_GOOGLE_SHEET_GID
 
   if (!apiKey || !spreadsheetId) {
     throw new Error('Konfigurasi Google Sheets belum lengkap di .env.local')
@@ -76,20 +89,30 @@ export async function fetchIssueData() {
   }
 
   const metadata = await metadataResponse.json()
-  const sheet = metadata.sheets?.find(({ properties }) => properties.sheetId === targetGid)
+  const sheets = (metadata.sheets ?? [])
+    .map(({ properties }) => ({ sheetId: properties.sheetId, title: properties.title }))
+    .filter(({ sheetId }) => !onlyGid || String(sheetId) === String(onlyGid))
 
-  if (!sheet) throw new Error(`Sheet dengan gid ${targetGid} tidak ditemukan.`)
+  if (!sheets.length) throw new Error('Sheet yang diminta tidak ditemukan pada spreadsheet.')
 
-  const range = encodeURIComponent(`'${sheet.properties.title.replaceAll("'", "''")}'`)
-  const valuesResponse = await fetch(
-    `${API_BASE}/${spreadsheetId}/values/${range}?majorDimension=ROWS&key=${apiKey}`,
-  )
+  const params = new URLSearchParams({ majorDimension: 'ROWS', key: apiKey })
+  sheets.forEach(({ title }) => params.append('ranges', `'${title.replaceAll("'", "''")}'`))
+
+  const valuesResponse = await fetch(`${API_BASE}/${spreadsheetId}/values:batchGet?${params}`)
 
   if (!valuesResponse.ok) throw new Error('Gagal membaca data dari Google Sheets.')
 
-  const data = await valuesResponse.json()
+  const { valueRanges = [] } = await valuesResponse.json()
+
+  const sheetsData = sheets.map((sheet, index) => ({
+    ...sheet,
+    rows: normalizeRows(valueRanges[index]?.values, sheet.title),
+  }))
+
   return {
-    rows: normalizeRows(data.values),
-    sheetTitle: sheet.properties.title,
+    rows: sheetsData.flatMap((sheet) => sheet.rows),
+    sheets: sheetsData
+      .filter((sheet) => sheet.rows.length > 0)
+      .map((sheet) => ({ sheetId: sheet.sheetId, title: sheet.title })),
   }
 }
